@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1, viewport-fit=cover"
+  />
+  <title>Student Q&A Chat</title>
+  <style>
+    :root{--bg:#0b1220;--card:#121a2b;--muted:#8aa0c7;--text:#e9eefc;--brand:#4da3ff;}
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,"Noto Sans",sans-serif}
+    .wrap{max-width:900px;margin:0 auto;padding:16px;display:flex;flex-direction:column;min-height:100dvh}
+    header{display:flex;flex-direction:column;gap:10px;margin-bottom:12px}
+    h1{font-size:1.2rem;margin:0}
+    .row{display:flex;gap:8px;flex-wrap:wrap}
+    input,button,textarea{border-radius:12px;border:1px solid transparent;background:#0f1729;color:var(--text)}
+    input,textarea{padding:12px}
+    input[type="email"]{flex:1;min-width:220px}
+    button{padding:12px 14px;background:var(--brand);color:#001734;font-weight:600;cursor:pointer}
+    button.secondary{background:#1b2742;color:var(--text)}
+    .meta{color:var(--muted);font-size:.9rem}
+    .card{background:var(--card);border:1px solid #1a2846;border-radius:16px;padding:12px;display:flex;flex-direction:column;gap:8px;min-height:0}
+    .chat{flex:1;overflow:auto;display:flex;flex-direction:column;gap:12px;padding:8px}
+    .msg{display:flex;gap:8px;align-items:flex-start}
+    .msg .bubble{padding:12px 14px;border-radius:14px;max-width:min(90%,720px);line-height:1.4}
+    .me .bubble{background:#072a4d;border:1px solid #0f3e75}
+    .ai .bubble{background:#0d203a;border:1px solid #163a6e}
+    .muted{color:var(--muted)}
+    .inputbar{display:flex;gap:8px;align-items:flex-end}
+    textarea{flex:1;min-height:52px;max-height:160px;resize:vertical}
+    .small{font-size:.85rem}
+    .usage{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+    .pill{background:#0f1729;border:1px solid #1a2846;border-radius:999px;padding:6px 10px}
+    .footer{margin-top:8px;color:var(--muted)}
+    .spinner{width:18px;height:18px;border:3px solid #1b3a6b;border-top-color:#86b7ff;border-radius:50%;animation:spin 1s linear infinite}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    @media (max-width:600px){h1{font-size:1.05rem}}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>Student Q&A Chat</h1>
+      <div class="row">
+        <input id="email" type="email" placeholder="Enter your email (required)" />
+        <button id="saveEmail">Save</button>
+        <button id="resetChat" class="secondary">Reset chat</button>
+      </div>
+      <div class="usage meta">
+        <span id="usageInfo" class="pill">Remaining today: —</span>
+        <span class="pill small">Daily limit: 1000 tokens (resets at 12:00 AM IST)</span>
+      </div>
+    </header>
+
+    <div class="card" style="flex:1">
+      <div id="chat" class="chat" aria-live="polite">
+        <div class="msg ai">
+          <div class="bubble">
+            👋 Welcome! Ask your UPSC/OPSC questions. Keep your email saved so your daily token usage is tracked properly.
+          </div>
+        </div>
+      </div>
+
+      <div class="inputbar">
+        <textarea id="prompt" placeholder="Type your question… (Shift+Enter for new line)"></textarea>
+        <button id="send">Send</button>
+      </div>
+      <div class="footer small">Tip: concise questions save tokens.</div>
+    </div>
+  </div>
+
+  <script>
+    const chatEl   = document.getElementById("chat");
+    const promptEl = document.getElementById("prompt");
+    const sendBtn  = document.getElementById("send");
+    const emailEl  = document.getElementById("email");
+    const saveBtn  = document.getElementById("saveEmail");
+    const resetBtn = document.getElementById("resetChat");
+    const usageEl  = document.getElementById("usageInfo");
+
+    // persist email locally for convenience (usage is enforced server-side)
+    emailEl.value = localStorage.getItem("studentEmail") || "";
+
+    let messages = [];
+
+    function addMessage(role, content) {
+      const msg = document.createElement("div");
+      msg.className = "msg " + (role === "user" ? "me" : "ai");
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
+      bubble.textContent = content;
+      msg.appendChild(bubble);
+      chatEl.appendChild(msg);
+      chatEl.scrollTop = chatEl.scrollHeight;
+    }
+
+    function setLoading(isLoading) {
+      if (isLoading) {
+        const row = document.createElement("div");
+        row.className = "msg ai";
+        row.id = "loadingRow";
+        const bubble = document.createElement("div");
+        bubble.className = "bubble";
+        bubble.innerHTML = '<span class="spinner" style="display:inline-block;vertical-align:middle;margin-right:8px"></span> Thinking…';
+        row.appendChild(bubble);
+        chatEl.appendChild(row);
+        chatEl.scrollTop = chatEl.scrollHeight;
+      } else {
+        const row = document.getElementById("loadingRow");
+        if (row) row.remove();
+      }
+    }
+
+    async function sendMessage() {
+      const email = emailEl.value.trim();
+      const text = promptEl.value.trim();
+      if (!email) { alert("Please enter your email first."); return; }
+      if (!text) return;
+
+      addMessage("user", text);
+      messages.push({ role: "user", content: text });
+      promptEl.value = "";
+      setLoading(true);
+      sendBtn.disabled = true;
+
+      try {
+        const res = await fetch("/.netlify/functions/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email, messages })
+        });
+
+        const data = await res.json();
+
+        if (!res.ok) {
+          const err = data?.error || "Request failed.";
+          addMessage("assistant", "⚠️ " + err);
+          if (typeof data?.remaining_today === "number") {
+            usageEl.textContent = `Remaining today: ${data.remaining_today}`;
+          }
+        } else {
+          const reply = data.reply || "(No reply)";
+          addMessage("assistant", reply);
+          messages.push({ role: "assistant", content: reply });
+
+          const rem = data?.usage?.remaining_today;
+          usageEl.textContent = `Remaining today: ${typeof rem === "number" ? rem : "—"}`;
+        }
+      } catch (e) {
+        console.error(e);
+        addMessage("assistant", "⚠️ Network/server error. Please try again.");
+      } finally {
+        setLoading(false);
+        sendBtn.disabled = false;
+      }
+    }
+
+    // UI events
+    sendBtn.addEventListener("click", sendMessage);
+    promptEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+      }
+    });
+
+    saveBtn.addEventListener("click", () => {
+      const val = emailEl.value.trim();
+      if (!val) { alert("Enter a valid email."); return; }
+      localStorage.setItem("studentEmail", val);
+      addMessage("assistant", "✅ Email saved. Your daily usage will be tracked.");
+    });
+
+    resetBtn.addEventListener("click", () => {
+      messages = [];
+      chatEl.innerHTML = "";
+      addMessage("ai", "Chat reset. Ask your next question!");
+    });
+  </script>
+</body>
+</html>
