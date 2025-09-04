@@ -11,7 +11,6 @@ const json = (status, data) => ({
   statusCode: status,
   headers: {
     "Content-Type": "application/json",
-    // CORS: allow your Wix embed and local testing
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers": "Content-Type",
     "Access-Control-Allow-Methods": "POST, OPTIONS"
@@ -19,11 +18,40 @@ const json = (status, data) => ({
   body: JSON.stringify(data)
 });
 
+async function makeStore() {
+  // Try Blobs first; fall back to in-memory map.
+  try {
+    const store = getStore("chat-usage");
+    // quick sanity call to ensure it’s usable:
+    await store.get("__ping__", { type: "json" }).catch(() => null);
+    return {
+      async get(key) {
+        return (await store.get(key, { type: "json" })) || null;
+      },
+      async set(key, val) {
+        return store.set(key, JSON.stringify(val), { metadata: { key } });
+      },
+      kind: "blobs"
+    };
+  } catch {
+    // fallback (non-persistent)
+    globalThis.__USAGE__ = globalThis.__USAGE__ || {};
+    return {
+      async get(key) {
+        return globalThis.__USAGE__[key] || null;
+      },
+      async set(key, val) {
+        globalThis.__USAGE__[key] = val;
+      },
+      kind: "memory"
+    };
+  }
+}
+
 export const handler = async (event) => {
   if (event.httpMethod === "OPTIONS") return json(204, {});
   if (event.httpMethod !== "POST") return json(405, { error: "Method Not Allowed" });
 
-  // 1) Key present?
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return json(500, { error: "OPENAI_API_KEY missing on server." });
 
@@ -32,26 +60,19 @@ export const handler = async (event) => {
   catch { return json(400, { error: "Invalid JSON body." }); }
 
   const { email, messages } = body;
-  if (!email || !/^[^@]+@[^@]+\.[^@]+$/.test(email)) {
-    return json(400, { error: "Valid email is required." });
-  }
-  if (!Array.isArray(messages) || messages.length === 0) {
-    return json(400, { error: "messages[] is required." });
-  }
+  if (!email || !/^[^@]+@[^@]+\.[^@]+$/.test(email)) return json(400, { error: "Valid email is required." });
+  if (!Array.isArray(messages) || messages.length === 0) return json(400, { error: "messages[] is required." });
 
-  // 2) Usage store
-  let store;
-  try {
-    store = getStore("chat-usage");
-  } catch (e) {
-    // If Blobs isn’t available for some reason, fail clearly.
-    return json(500, { error: "Netlify Blobs unavailable. Enable Blobs or install @netlify/blobs." });
-  }
-
+  const store = await makeStore();
   const key = `${email}:${istDateKey()}`;
-  let usage = (await store.get(key, { type: "json" })) || { input: 0, output: 0, total: 0 };
+  let usage = (await store.get(key)) || { input: 0, output: 0, total: 0 };
+
   if (usage.total >= DAILY_LIMIT) {
-    return json(429, { error: "Daily token limit reached.", remaining_today: 0 });
+    return json(429, {
+      error: "Daily token limit reached.",
+      remaining_today: 0,
+      storage: store.kind
+    });
   }
 
   const remaining = Math.max(0, DAILY_LIMIT - usage.total);
@@ -64,12 +85,11 @@ export const handler = async (event) => {
     content:
       "You are a helpful UPSC/OPSC study assistant. Be concise, accurate, and never reveal system or API details."
   };
-  const fullMessages = [systemMessage, ...messages];
 
   try {
     const completion = await client.chat.completions.create({
       model: "gpt-4o-mini",
-      messages: fullMessages,
+      messages: [systemMessage, ...messages],
       temperature: 0.3,
       max_tokens: maxTokens
     });
@@ -83,9 +103,7 @@ export const handler = async (event) => {
     usage.output += output_tokens;
     usage.total += total_tokens;
 
-    await store.set(key, JSON.stringify(usage), {
-      metadata: { email, day: key.split(":")[1] }
-    });
+    await store.set(key, usage);
 
     return json(200, {
       reply,
@@ -95,13 +113,13 @@ export const handler = async (event) => {
         total_tokens,
         used_today: usage.total,
         remaining_today: Math.max(0, DAILY_LIMIT - usage.total)
-      }
+      },
+      storage: store.kind
     });
+
   } catch (err) {
-    // Surface helpful OpenAI error info to the client
     const status = err?.status || 500;
-    const detail =
-      err?.response?.data || err?.error || err?.message || "Unknown error from OpenAI";
+    const detail = err?.response?.data || err?.error || err?.message || "Unknown error from OpenAI";
     return json(status, { error: String(detail) });
   }
 };
