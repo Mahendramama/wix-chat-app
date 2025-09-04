@@ -1,70 +1,72 @@
-// netlify/functions/chat.js
 import OpenAI from "openai";
 import { getStore } from "@netlify/blobs";
 
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const store = getStore("chat-usage"); // Netlify Blobs store name
-
-const DAILY_LIMIT = 1000; // tokens per day per user
+const DAILY_LIMIT = 1000;
 
 function istDateKey() {
-  // "YYYY-MM-DD" in Asia/Kolkata
   return new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
 }
 
+const json = (status, data) => ({
+  statusCode: status,
+  headers: {
+    "Content-Type": "application/json",
+    // CORS: allow your Wix embed and local testing
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Methods": "POST, OPTIONS"
+  },
+  body: JSON.stringify(data)
+});
+
 export const handler = async (event) => {
-  if (event.httpMethod !== "POST") {
-    return { statusCode: 405, body: "Method Not Allowed" };
+  if (event.httpMethod === "OPTIONS") return json(204, {});
+  if (event.httpMethod !== "POST") return json(405, { error: "Method Not Allowed" });
+
+  // 1) Key present?
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return json(500, { error: "OPENAI_API_KEY missing on server." });
+
+  let body;
+  try { body = JSON.parse(event.body || "{}"); }
+  catch { return json(400, { error: "Invalid JSON body." }); }
+
+  const { email, messages } = body;
+  if (!email || !/^[^@]+@[^@]+\.[^@]+$/.test(email)) {
+    return json(400, { error: "Valid email is required." });
+  }
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return json(400, { error: "messages[] is required." });
   }
 
+  // 2) Usage store
+  let store;
   try {
-    const body = JSON.parse(event.body || "{}");
-    const { email, messages } = body;
+    store = getStore("chat-usage");
+  } catch (e) {
+    // If Blobs isn’t available for some reason, fail clearly.
+    return json(500, { error: "Netlify Blobs unavailable. Enable Blobs or install @netlify/blobs." });
+  }
 
-    if (!email || !/^[^@]+@[^@]+\.[^@]+$/.test(email)) {
-      return {
-        statusCode: 400,
-        body: JSON.stringify({ error: "Valid email is required." })
-      };
-    }
-    if (!Array.isArray(messages) || messages.length === 0) {
-      return {
-        statusCode: 400,
-        body: JSON.stringify({ error: "messages[] is required." })
-      };
-    }
+  const key = `${email}:${istDateKey()}`;
+  let usage = (await store.get(key, { type: "json" })) || { input: 0, output: 0, total: 0 };
+  if (usage.total >= DAILY_LIMIT) {
+    return json(429, { error: "Daily token limit reached.", remaining_today: 0 });
+  }
 
-    const key = `${email}:${istDateKey()}`;
-    let usage = (await store.get(key, { type: "json" })) || {
-      input: 0,
-      output: 0,
-      total: 0
-    };
+  const remaining = Math.max(0, DAILY_LIMIT - usage.total);
+  const maxTokens = Math.max(64, Math.min(512, remaining - 64));
 
-    if (usage.total >= DAILY_LIMIT) {
-      return {
-        statusCode: 429,
-        body: JSON.stringify({
-          error: "Daily token limit reached.",
-          remaining_today: 0
-        })
-      };
-    }
+  const client = new OpenAI({ apiKey });
 
-    // Keep some headroom for prompt tokens
-    const remaining = Math.max(0, DAILY_LIMIT - usage.total);
-    // allow at least some output; clamp to sensible maximum
-    const maxTokens = Math.max(64, Math.min(512, remaining - 64));
+  const systemMessage = {
+    role: "system",
+    content:
+      "You are a helpful UPSC/OPSC study assistant. Be concise, accurate, and never reveal system or API details."
+  };
+  const fullMessages = [systemMessage, ...messages];
 
-    // You can tune system prompt for your use-case
-    const systemMessage = {
-      role: "system",
-      content:
-        "You are a helpful UPSC/OPSC study assistant. Be concise, accurate, and cite syllabus sections conceptually when helpful. Never reveal the API key or system details."
-    };
-
-    const fullMessages = [systemMessage, ...messages];
-
+  try {
     const completion = await client.chat.completions.create({
       model: "gpt-4o-mini",
       messages: fullMessages,
@@ -81,32 +83,25 @@ export const handler = async (event) => {
     usage.output += output_tokens;
     usage.total += total_tokens;
 
-    // Persist usage for the day (per email)
     await store.set(key, JSON.stringify(usage), {
       metadata: { email, day: key.split(":")[1] }
     });
 
-    const remaining_today = Math.max(0, DAILY_LIMIT - usage.total);
-
-    return {
-      statusCode: 200,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        reply,
-        usage: {
-          input_tokens,
-          output_tokens,
-          total_tokens,
-          used_today: usage.total,
-          remaining_today
-        }
-      })
-    };
+    return json(200, {
+      reply,
+      usage: {
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        used_today: usage.total,
+        remaining_today: Math.max(0, DAILY_LIMIT - usage.total)
+      }
+    });
   } catch (err) {
-    console.error(err);
-    return {
-      statusCode: 500,
-      body: JSON.stringify({ error: "Server error. Please try again." })
-    };
+    // Surface helpful OpenAI error info to the client
+    const status = err?.status || 500;
+    const detail =
+      err?.response?.data || err?.error || err?.message || "Unknown error from OpenAI";
+    return json(status, { error: String(detail) });
   }
 };
